@@ -1,0 +1,123 @@
+"""
+過去データの自動取得バッチ。
+
+データソース: PayPay銀行が公開している「直近1年分」の当せん結果CSV
+  https://login.paypay-bank.co.jp/lottery/co/numbers3jnb.csv
+  (同行サイトで「数字の分析にご活用ください」として分析目的の利用が案内されているデータです)
+
+このスクリプトは実行するたびに直近1年分すべてを取得し、DBに存在しない回号のみ
+INSERTします(ON CONFLICT DO NOTHING)。そのため、
+  - 初回実行 → 直近1年分がまとめてバックフィルされる
+  - 以降、毎日1回実行 → 新しく増えた回だけが自動的に追加される
+という「バックフィル」と「日次自動更新」を同じスクリプトで両立できます。
+
+実行方法:
+    python -m app.collector
+
+GitHub Actions等での自動実行方法は docs/BUILD_GUIDE.md を参照してください。
+
+注意: 1年より前の古いデータはこのCSVには含まれません。より古いデータが必要な場合は
+別途データソースの検討が必要です(公式サイトのJS描画ページのスクレイピングが必要になるため
+このスクリプトの対象外としています)。
+"""
+import csv
+import io
+import re
+from datetime import datetime
+
+import requests
+from sqlalchemy import text
+
+from . import db
+
+CSV_URL = "https://login.paypay-bank.co.jp/lottery/co/numbers3jnb.csv"
+
+# CSVの列順(ヘッダー行に対応)
+# 第,抽せん日,抽せん曜日,当選数字,[ストレート]当選金額,[ストレート]当選口数,
+# [ボックス]当選金額,[ボックス]当選口数,[セット(ストレート)]当選金額,[セット(ストレート)]当選口数,
+# [セット(ボックス)]当選金額,[セット(ボックス)]当選口数,[ミニ]当選金額,[ミニ]当選口数
+
+
+def _to_int(value: str) -> int:
+    """'118,500' のようなカンマ区切り金額を int に変換。空文字は0扱い。"""
+    if not value:
+        return 0
+    return int(value.replace(",", "").strip() or 0)
+
+
+def fetch_csv_rows() -> list[dict]:
+    resp = requests.get(CSV_URL, timeout=15)
+    resp.raise_for_status()
+    # 配信元はShift-JIS(CP932)エンコーディング
+    text_data = resp.content.decode("cp932")
+    reader = csv.reader(io.StringIO(text_data))
+
+    rows = []
+    for row in reader:
+        if not row or len(row) < 4:
+            continue
+        raw_no = row[0]
+        m = re.search(r"(\d+)", raw_no)
+        if not m:
+            continue  # ヘッダー行などをスキップ
+        draw_no = int(m.group(1))
+
+        draw_date = datetime.strptime(row[1].strip(), "%Y/%m/%d").date()
+        straight_num = row[3].strip().zfill(3)
+        if not straight_num.isdigit() or len(straight_num) != 3:
+            continue
+
+        rows.append(
+            {
+                "draw_no": draw_no,
+                "draw_date": draw_date.isoformat(),
+                "digit1": int(straight_num[0]),
+                "digit2": int(straight_num[1]),
+                "digit3": int(straight_num[2]),
+                "straight_num": straight_num,
+                "straight_payout": _to_int(row[4]) if len(row) > 4 else None,
+                "box_payout": _to_int(row[6]) if len(row) > 6 else None,
+            }
+        )
+    return rows
+
+
+def save_rows(rows: list[dict]) -> int:
+    """未登録の回のみINSERT。挿入件数を返す。"""
+    inserted = 0
+    with db.engine.begin() as conn:
+        for r in rows:
+            result = conn.execute(
+                text(
+                    """
+                    INSERT INTO draws
+                        (draw_no, draw_date, digit1, digit2, digit3,
+                         straight_num, box_type, straight_payout, box_payout)
+                    VALUES
+                        (:draw_no, :draw_date, :digit1, :digit2, :digit3,
+                         :straight_num, 'straight', :straight_payout, :box_payout)
+                    ON CONFLICT (draw_no) DO NOTHING
+                    """
+                ),
+                r,
+            )
+            inserted += result.rowcount
+    return inserted
+
+
+def main():
+    rows = fetch_csv_rows()
+    if not rows:
+        print("CSVからデータを取得できませんでした")
+        return
+    inserted = save_rows(rows)
+    latest = max(r["draw_no"] for r in rows)
+    print(
+        f"取得件数: {len(rows)}件 / 新規登録: {inserted}件 / "
+        f"最新回号: 第{latest}回"
+    )
+
+
+if __name__ == "__main__":
+    main()
+

@@ -1,0 +1,99 @@
+"""
+ナンバーズ3 分析API
+--------------------------------------------------
+起動: uvicorn app.main:app --reload --port 8000
+"""
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from . import db
+from .analysis import generate_top_candidates, run_backtest, compute_digit_frequency
+
+app = FastAPI(
+    title="Numbers3 Analytics API",
+    description=(
+        "ナンバーズ3の過去データに基づく統計分析API。"
+        "本APIが返すスコアは統計的傾向の参考値であり、当選を保証するものではありません。"
+    ),
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 本番では自社ドメイン/アプリスキームに限定すること
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class CandidateOut(BaseModel):
+    number: str
+    bet_type: str
+    score: float
+    reason_tags: list[str]
+
+
+class PredictionResponse(BaseModel):
+    target_draw_no: int
+    disclaimer: str
+    straight: list[CandidateOut]
+    box: list[CandidateOut]
+
+
+DISCLAIMER = (
+    "本予想は過去の出現傾向に基づく統計参考情報です。"
+    "抽選は毎回独立事象であり、当選を保証するものではありません。"
+)
+
+
+@app.get("/api/v1/predictions/today", response_model=PredictionResponse)
+def get_today_predictions(window: int = 30, top_n: int = 3):
+    draws_df = db.fetch_draws(limit=max(window, 100))
+    if draws_df.empty:
+        raise HTTPException(status_code=404, detail="抽選データが存在しません")
+
+    candidates = generate_top_candidates(draws_df, top_n=top_n, window=window)
+    target_draw_no = db.fetch_next_draw_no()
+    db.save_candidates(target_draw_no, candidates)
+
+    straight = [c for c in candidates if c.bet_type == "straight"]
+    box = [c for c in candidates if c.bet_type == "box"]
+
+    return PredictionResponse(
+        target_draw_no=target_draw_no,
+        disclaimer=DISCLAIMER,
+        straight=[CandidateOut(**vars(c)) for c in straight],
+        box=[CandidateOut(**vars(c)) for c in box],
+    )
+
+
+@app.get("/api/v1/analysis/digit-frequency")
+def get_digit_frequency(window: int = 30):
+    draws_df = db.fetch_draws(limit=max(window, 100))
+    if draws_df.empty:
+        raise HTTPException(status_code=404, detail="抽選データが存在しません")
+    freq = compute_digit_frequency(draws_df, window=window)
+    return {
+        "window": window,
+        "digits": [
+            {"digit": int(idx), "pos1": int(row.pos1), "pos2": int(row.pos2),
+             "pos3": int(row.pos3), "total": int(row.total)}
+            for idx, row in freq.iterrows()
+        ],
+    }
+
+
+@app.get("/api/v1/backtest")
+def get_backtest(window: int = 30, stake: int = 200):
+    draws_df = db.fetch_draws(limit=500)
+    if len(draws_df) <= window:
+        raise HTTPException(status_code=400, detail="バックテストに十分なデータがありません")
+    result = run_backtest(draws_df, window=window, stake_per_bet=stake)
+    result["disclaimer"] = DISCLAIMER
+    return result
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
